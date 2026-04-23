@@ -1,0 +1,170 @@
+name: CI — Test, Build, Push & Update Manifests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# FIX MEDIUM-05 / RACE CONDITION: Serialize runs on main — never concurrent
+# Prevents two simultaneous pushes corrupting the gitops-repo manifest
+concurrency:
+  group: ci-main
+  cancel-in-progress: false   # Queue, do not cancel — every commit gets deployed
+
+permissions:
+  id-token: write   # OIDC token exchange
+  contents: read    # Checkout
+
+env:
+  AWS_REGION:      ${{ vars.AWS_REGION }}       # e.g. us-east-1
+  ECR_REPOSITORY:  ${{ vars.ECR_REPOSITORY }}   # e.g. gitops-eks/myapp
+  IMAGE_TAG:       sha-${{ github.sha }}
+
+jobs:
+  # ============================================================================
+  # JOB 1: Run tests — FIX HIGH-07: broken code must not reach EKS
+  # ============================================================================
+  test:
+    name: Run Unit Tests
+    # FIX MEDIUM-06: pin runner version — ubuntu-latest is non-deterministic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: src/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r src/requirements.txt
+
+      - name: Run pytest
+        run: |
+          cd src
+          python -m pytest tests/ -v --tb=short
+
+  # ============================================================================
+  # JOB 2: Build, push to ECR, update GitOps manifests
+  # Only runs on push to main (not on PRs) AND only if tests pass
+  # ============================================================================
+  build-push-update:
+    name: Build → Push ECR → Update Manifests
+    runs-on: ubuntu-24.04   # FIX MEDIUM-06: pinned version
+    timeout-minutes: 20
+    needs: test             # FIX HIGH-07: build only after tests pass
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+
+      # ── AWS Auth via OIDC (no static credentials) ─────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ vars.AWS_ROLE_ARN }}
+          aws-region:        ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-CI-${{ github.run_id }}
+
+      # ── ECR Login ─────────────────────────────────────────────────────────
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Docker Build & Push ───────────────────────────────────────────────
+      # FIX CRITICAL-05: Removed --cache-from :latest (ECR is IMMUTABLE, :latest never exists)
+      # FIX CRITICAL-06: Removed --build-arg APP_VERSION (no ARG in Dockerfile — was silently ignored)
+      - name: Build and push Docker image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "Building: ${IMAGE_URI}"
+
+          docker build \
+            --tag  "${IMAGE_URI}" \
+            --file Dockerfile \
+            .
+
+          echo "Pushing: ${IMAGE_URI}"
+          docker push "${IMAGE_URI}"
+
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}"  >> "$GITHUB_OUTPUT"
+
+          echo "✅ Image pushed: ${IMAGE_URI}"
+
+      # ── Checkout GitOps repo ──────────────────────────────────────────────
+      # FIX HIGH-10: Renamed vars.GITHUB_ORG → vars.GH_ORG (avoid reserved GITHUB_ prefix)
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GH_ORG }}/${{ vars.GITOPS_REPO }}
+          token:      ${{ secrets.GITOPS_PAT }}
+          path:       gitops-repo
+
+      # ── Update image tag in deployment manifest ───────────────────────────
+      - name: Update image tag in deployment.yaml
+        env:
+          IMAGE_URI: ${{ steps.build-image.outputs.image_uri }}
+        run: |
+          MANIFEST="gitops-repo/apps/myapp/deployment.yaml"
+          echo "Updating manifest: ${MANIFEST}"
+
+          bash scripts/update-image-tag.sh \
+            --manifest   "${MANIFEST}" \
+            --image-uri  "${IMAGE_URI}" \
+            --container  myapp
+
+      # ── Commit & push with rebase-retry ───────────────────────────────────
+      # FIX MEDIUM-05: Rebase-retry loop prevents race condition when two
+      # CI runs finish close together and second push gets rejected
+      - name: Commit and push manifest update
+        working-directory: gitops-repo
+        env:
+          IMAGE_TAG: ${{ steps.build-image.outputs.image_tag }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add apps/myapp/deployment.yaml
+
+          if git diff --cached --quiet; then
+            echo "No manifest changes detected — skipping commit."
+            exit 0
+          fi
+
+          git commit -m "chore(deploy): update myapp image to ${IMAGE_TAG}
+
+          Triggered by: ${{ github.repository }}@${{ github.sha }}
+          Actor: ${{ github.actor }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Rebase-retry loop (up to 3 attempts) to handle concurrent pushes
+          MAX_RETRIES=3
+          for attempt in $(seq 1 ${MAX_RETRIES}); do
+            echo "Push attempt ${attempt}/${MAX_RETRIES}..."
+            if git push origin main; then
+              echo "✅ Manifest update pushed successfully."
+              break
+            fi
+            if [[ ${attempt} -lt ${MAX_RETRIES} ]]; then
+              echo "Push rejected — rebasing and retrying in $((attempt * 3))s..."
+              sleep $((attempt * 3))
+              git pull --rebase origin main
+            else
+              echo "ERROR: All ${MAX_RETRIES} push attempts failed." >&2
+              exit 1
+            fi
+          done
